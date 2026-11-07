@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# Rebuildable caches and run logs
+data/cache/
+logs/
+
+# MCPTox data (third-party). Download pure_tool.json from the MCPTox repository into data/,
+# then rebuild: python -m benchmark.prepare_mcptox && python -m benchmark.make_sequences
+data/pure_tool.json
+data/mcptox_malicious.jsonl
+data/sequences.jsonl
+data/versions.jsonl

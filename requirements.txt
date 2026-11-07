@@ -1,0 +1,10 @@
+# Install CPU torch first:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# Exact versions are pinned after install; see requirements.lock.txt.
+pytest
+numpy
+pandas
+scikit-learn
+matplotlib
+mcp
+sentence-transformers
