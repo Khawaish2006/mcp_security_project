@@ -3,7 +3,7 @@ import random
 import pytest
 
 from benchmark.benign_edits import BENIGN_TYPES, apply_edit, detect_domain, random_edit
-from benchmark.make_sequences import build_sequences, flatten
+from benchmark.make_sequences import DATA, build_sequences, flatten
 from benchmark.slow_attacks import decompose_fragments, extract_components, pick_helper_tool, split_fragments
 from benchmark.soften import soften
 from benchmark.splits import leak_check, leave_one_paradigm_out
@@ -80,6 +80,8 @@ def test_decompose_needs_a_component():
 
 @pytest.fixture(scope="module")
 def sequences():
+    if not (DATA / "mcptox_malicious.jsonl").exists():
+        pytest.skip("MCPTox-derived data not present (not in the repo); run benchmark.prepare_mcptox first")
     return build_sequences(seed=42)
 
 

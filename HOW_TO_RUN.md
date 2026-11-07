@@ -2,7 +2,9 @@
 
 This guide covers getting the `mcp-security` folder running on your own laptop. No GPU, GitHub access or API key is needed. Expect about 15 minutes for setup and under 10 minutes for the full experiment run.
 
-For what the project does and what the results mean, see [README.md](README.md).
+For what the project does and what the results mean, see [README.md](README.md). For example inputs and the exact output each command should print, see [EXPECTED_RESULTS.md](EXPECTED_RESULTS.md).
+
+**Got the project from GitHub?** Clone it with `git clone https://github.com/Khawaish2006/mcp_security_project.git`. The MCPTox dataset (`data/pure_tool.json`) is not in the repository. The demo, the MCP check and `try_update` work without it; rebuilding the dataset and rerunning the experiments need it (step 7).
 
 ---
 
@@ -59,12 +61,13 @@ You'll know the environment is active when your prompt starts with `(.venv)`. Ac
 python -m pytest -q
 ```
 
-Expected result: **58 passed** in under a minute. These tests use a lightweight stand-in for the embedding model, so they need no download.
+Expected result: **58 passed** in under a minute, or **52 passed, 6 skipped** in a GitHub clone without the MCPTox data. These tests use a lightweight stand-in for the embedding model, so they need no download.
 
 ## 5. Run the project
 
 | What | Command | Time | Output |
 |---|---|---|---|
+| Score your own description change | `python -m experiments.try_update --tool get_weather --old "..." --new "..."` | under 1 min | risks, flags, each policy's decision |
 | Demo: scripted rug-pull scenarios through the gateway | `python -m experiments.demo` | about 1 min | prints decisions; writes `logs/` |
 | Real MCP check: client → gateway proxy → mock server | `python -m experiments.mcp_e2e slow_rug_pull mdp` | about 1–2 min | prints what the client can see and call |
 | Quick experiment run (fewer seeds, coarser grid) | `python -m experiments.run_eval --quick` | about 3 min | rewrites `results/` and `models/` |

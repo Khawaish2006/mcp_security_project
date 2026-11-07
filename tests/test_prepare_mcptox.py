@@ -1,4 +1,6 @@
-from benchmark.prepare_mcptox import load_records, report, split_template1
+import pytest
+
+from benchmark.prepare_mcptox import SRC, load_records, report, split_template1
 
 
 def test_split_with_period():
@@ -19,6 +21,7 @@ def test_no_clean_prefix_when_poison_first():
     assert poison.startswith("Before retrieving")
 
 
+@pytest.mark.skipif(not SRC.exists(), reason="MCPTox data/pure_tool.json not present (not in the repo; see HOW_TO_RUN.md)")
 def test_dataset_loads_completely():
     rows = load_records()
     stats = report(rows)
