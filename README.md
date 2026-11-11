@@ -7,6 +7,8 @@ Research prototype. A gateway between an AI client and MCP servers decides wheth
 - **RugPullBench:** 991 sequences of description versions (benign edits, one-shot, slow-split, slow-decomposed and mixed attacks) built from MCPTox poisons and 118 official MCP tool descriptions.
 - **Real-world data:** 53 real description changes from the official MCP servers' git history and 513 from 13 community repos (both used for training), plus a final held-out set of 273 changes from 10 fresh community repos, scored once.
 
+**New to the project? Start with [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md)**: the idea, solution, implementation, results and the story of how we got there, in one place.
+
 See [results/tables.md](results/tables.md) for all numbers, [results/](results/) for the figures and [results/demo_output.txt](results/demo_output.txt) for the demo run.
 
 ## Main findings (test servers never seen in training; 5 server splits where noted)
