@@ -12,7 +12,13 @@ import matplotlib.pyplot as plt  # noqa: E402
 NICE = {"no_protection": "No protection", "hash_pinning": "Hash pinning", "threshold_new_only": "Classifier (new text only)",
         "threshold": "Change-pair + threshold", "history_rule": "Change-pair + history rule",
         "cumulative_threshold": "Change-pair + cumulative threshold (ours)", "mdp": "Change-pair + MDP (ours)"}
-POLICY_COLUMNS = ["hash_pinning", "threshold_new_only", "threshold", "history_rule", "cumulative_threshold", "mdp"]
+NICE_DET = {"change_pair": "Change-pair step head (ours)", "new_only": "New text only (embeddings)",
+            "tfidf_new": "TF-IDF of new text", "tfidf_added": "TF-IDF of added text",
+            "ablation_whole_text_no_real": "Ablation: whole-text embedding, no real data (previous method)",
+            "ablation_pooled_no_real": "Ablation: sentence pooling, no real data",
+            "ablation_embeddings_with_real": "Ablation: embeddings instead of TF-IDF, same training data",
+            "ablation_chosen_no_real": "Ablation: chosen model, no real changes in training"}
+POLICY_COLUMNS =["hash_pinning", "threshold_new_only", "threshold", "history_rule", "cumulative_threshold", "mdp"]
 
 
 def _pct(x):
@@ -53,8 +59,8 @@ def _policy_section(p: dict) -> list[str]:
     names = [n for n in POLICY_COLUMNS if n in next(iter(p["by_seq_type"].values()))]
     md += ["Attack success rate by sequence type (benign row shows false-block rate):", "", _table(
         ["type", "n", *(NICE[n] for n in names)],
-        [[t, v["n"], *(_pct(v[n]["asr"]) if t != "benign" else f"FBR {_pct(v[n]['fbr'])}" for n in names)]
-         for t, v in p["by_seq_type"].items()]), ""]
+        [[t, v["n"], *(_pct(v[n]["asr"]) if not t.startswith("benign") else f"FBR {_pct(v[n]['fbr'])}" for n in names)]
+         for t, v in p["by_seq_type"].items() if v["n"]]), ""]
     return md
 
 
@@ -67,11 +73,43 @@ def write_report(out: dict, results_dir: Path) -> None:
 
     d = out["detector"]
     md += ["## Detector (per update)", "", _table(
-        ["model", "precision", "recall", "F1", "FPR", "ROC-AUC", "PR-AUC"],
-        [[name, *(d[key].get(m, "n/a") for m in ("precision", "recall", "f1", "fpr", "roc_auc", "pr_auc"))]
-         for name, key in (("Change-pair step head (ours)", "change_pair"), ("New text only", "new_only"),
+        ["model", "precision", "recall", "F1", "FPR", "recall at FPR<=5%", "recall at FPR<=10%", "ROC-AUC", "PR-AUC"],
+        [[name, *(d[key].get(m, "n/a") for m in ("precision", "recall", "f1", "fpr", "recall_at_fpr5", "recall_at_fpr10",
+                                                  "roc_auc", "pr_auc"))]
+         for name, key in (("Change-pair step head (ours)", "change_pair"), ("New text only (embeddings)", "new_only"),
+                          ("TF-IDF of new text", "tfidf_new"), ("TF-IDF of added text", "tfidf_added"),
                           ("Cumulative head (ours, label: attack added since approval)", "cumulative_head"))
-        if key in d]), ""]
+        if key in d]), "", "Precision, recall, F1 and FPR at threshold 0.5.", ""]
+    if "head_selection" in out:
+        ch = out["head_selection"]["chosen"]
+        md += [f"Detector settings chosen on validation (recall at FPR<=5%): step head = {ch['step']['features']}, "
+               f"C={ch['step']['C']}; cumulative head = {ch['cum']['features']}, C={ch['cum']['C']}.", ""]
+    if "real_world" in out and "detectors" in out["real_world"]:
+        rw = out["real_world"]
+        md += [f"## Held-out real-world false positives ({rw['changes']} real description changes, {rw['tools']} tools, "
+               f"{rw['servers']} {rw.get('source', 'git history')}; never used to fit or tune)", "", _table(
+                   ["detector", "FPR at 0.5", "FPR at val FPR<=5% threshold", "same, averaged per repo", "threshold",
+                    "mean risk"],
+                   [[NICE_DET.get(k, k), _pct(v["fpr_at_0.5"]), _pct(v["fpr_at_val_fpr5_threshold"]),
+                     _pct(v.get("fpr_at_val_fpr5_threshold_repo_avg")), v["val_fpr5_threshold"], v["mean_score"]]
+                    for k, v in rw["detectors"].items()]), ""]
+        rb = out.get("robustness")
+        if rb:
+            md += [f"### Robustness on the test servers (same thresholds; {rb['softened_n']} softened, "
+                   f"{rb['reworded_n']} reworded attack updates)", "", _table(
+                       ["detector", "attacks caught", "legitimate flagged", "softened caught",
+                        "reworded: as written", "reworded: reworded"],
+                       [[NICE_DET.get(k, k), _pct(v["recall"]), _pct(v["fpr"]), _pct(v["softened_recall"]),
+                         _pct(v["reworded_recall_original"]), _pct(v["reworded_recall"])] for k, v in rb["detectors"].items()]),
+                   ""]
+        dv = rw.get("development_set_cv")
+        if dv:
+            md += [f"Development set ({dv['changes']} changes from the official servers, part of training; "
+                   f"{dv['folds']}-fold grouped cross-validation): FPR at 0.5 = {_pct(dv['fpr_at_0.5'])}.", ""]
+        if "policies" in rw:
+            md += ["Gateway policies on the real histories (all legitimate):", "", _table(
+                ["policy", "false-block rate", "review burden"],
+                [[NICE.get(k, k), _pct(v["fbr"]), _pct(v["rb"])] for k, v in rw["policies"].items()]), ""]
     md += ["### Recall / FPR by attack style", "", _table(
         ["style", "n", "change-pair recall", "new-only recall"],
         [[k, v["change_pair"]["n"], v["change_pair"]["recall"], v["new_only"]["recall"]]
@@ -121,9 +159,19 @@ def write_report(out: dict, results_dir: Path) -> None:
             ["attack type", "attack seqs", "max per-step risk", "final cumulative risk", "new text only"],
             [[t, v["n_attack"], v["max_step_risk"], v["final_cumulative_risk"], v["new_only_final"]]
              for t, v in u["sequence_level_auc"].items()]), ""]
+    if "unseen_slow_augmented" in out:
+        a = out["unseen_slow_augmented"]
+        md += ["## Unseen slow strategy, with defender-side augmentation", "",
+               f"Same setting, plus {a['augmented_updates']} synthetic slow-history updates that the defender makes by "
+               "splitting its own known one-shot poisons into 2-4 pieces (benchmark/augment.py). No attacker "
+               "slow template is used. The test set is unchanged.", ""]
+        md += _policy_section(a)
 
     if "multi_split" in out:
-        for name, title in (("seen", "all strategies seen in training"), ("unseen_slow", "slow strategies unseen")):
+        for name, title in (("seen", "all strategies seen in training"), ("unseen_slow", "slow strategies unseen"),
+                            ("unseen_slow_augmented", "slow strategies unseen, defender-side augmentation")):
+            if name not in out["multi_split"]:
+                continue
             ms = out["multi_split"][name]
             md += [f"## Robustness over {len(ms['splits'])} server splits: {title}", "",
                    "Mean ± std across independent server-grouped splits (seeds "
@@ -175,9 +223,11 @@ def write_report(out: dict, results_dir: Path) -> None:
     panels = [("All strategies seen in training", p)]
     if "unseen_slow" in out:
         panels.append(("Slow strategies unseen in training", out["unseen_slow"]))
+    if "unseen_slow_augmented" in out:
+        panels.append(("Unseen, with defender augmentation", out["unseen_slow_augmented"]))
     fig, axes = plt.subplots(1, len(panels), figsize=(6.5 * len(panels), 4.2), sharey=True, squeeze=False)
     for ax, (title, section) in zip(axes[0], panels):
-        types = [t for t in section["by_seq_type"] if t != "benign"]
+        types = [t for t in section["by_seq_type"] if not t.startswith("benign")]
         names = [n for n in POLICY_COLUMNS if n in section["by_seq_type"][types[0]]]
         width = 0.8 / len(names)
         for i, n in enumerate(names):
@@ -191,6 +241,23 @@ def write_report(out: dict, results_dir: Path) -> None:
     fig.tight_layout()
     fig.savefig(results_dir / "asr_by_attack_type.png", dpi=150)
     plt.close(fig)
+
+    curves = out["detector"].get("pr_curves")
+    if curves:
+        fig, ax = plt.subplots(figsize=(6.5, 4.5))
+        for key, pts in curves.items():
+            ax.plot([q[0] for q in pts], [q[1] for q in pts], label=NICE_DET.get(key, key),
+                    linewidth=2.2 if key == "change_pair" else 1.2)
+        ax.set_xlabel("Recall (attack updates caught)")
+        ax.set_ylabel("Precision")
+        ax.set_title("Precision-recall per update (test servers)")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1.02)
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+        fig.savefig(results_dir / "precision_recall.png", dpi=150)
+        plt.close(fig)
 
 
 if __name__ == "__main__":

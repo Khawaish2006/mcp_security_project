@@ -82,10 +82,12 @@ _NOT_A_TOOL = re.compile(r"PromptArgument\(|types\.Prompt\(|types\.Resource\(|mi
 _SERVER_META = re.compile(r"^\s*,\s*version\s*:")
 # A tool name must be followed by its description within this many characters.
 _WINDOW = 700
+_POSITIONAL_TOOL = re.compile(r"\.tool\(\s*[\"'`]([\w\-]+)[\"'`]\s*,\s*(?=[\"'`])")
 
 
 def _unescape(s: str) -> str:
-    return s.replace("\\n", " ").replace('\\"', '"').replace("\\'", "'").replace("\\\\", "\\")
+    return (s.replace("\\n", " ").replace('\\"', '"').replace("\\'", "'").replace("\\`", "`")
+            .replace("\\\\", "\\"))
 
 
 def read_strings(src: str, pos: int) -> tuple[str, int]:
@@ -130,6 +132,11 @@ def extract_tools(src: str) -> list[tuple[str, str]]:
                 desc = resolve_constant(src, ident_m.group(1)) if ident_m else ""
             if desc:
                 found[m.start()] = (name, desc)
+    # TypeScript SDK positional form: server.tool("name", "description", schema, handler).
+    for m in _POSITIONAL_TOOL.finditer(src):
+        desc, _ = read_strings(src, m.end())
+        if desc and m.start() not in found:
+            found[m.start()] = (m.group(1), desc)
     # Keep the first description seen for each tool name, in source order.
     tools = {}
     for _, (name, desc) in sorted(found.items()):

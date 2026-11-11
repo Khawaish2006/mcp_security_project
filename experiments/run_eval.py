@@ -19,9 +19,13 @@ from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
-from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score, roc_auc_score
+from sklearn.metrics import (average_precision_score, f1_score, precision_recall_curve, precision_score, recall_score,
+                             roc_auc_score, roc_curve)
 from sklearn.model_selection import GroupKFold
 
+from benchmark.augment import augment_slow
+from benchmark.reword_attacks import reword_update
+from experiments.baselines import TfidfDetector
 from experiments.simulate import simulate, simulate_avg
 from gateway.detector import ChangeDetector, DualDetector
 from gateway.embedder import SentenceEmbedder
@@ -65,6 +69,14 @@ def to_sequences(rows: list[dict], r_step: np.ndarray, r_cum: np.ndarray) -> lis
     return list(seqs.values())
 
 
+def recall_at_fpr(y, p, target: float) -> tuple[float, float]:
+    """Highest recall with false-positive rate <= target, and the threshold that gives it."""
+    fpr, tpr, thr = roc_curve(y, p)
+    ok = np.where(fpr <= target)[0]
+    i = ok[np.argmax(tpr[ok])]
+    return float(tpr[i]), float(min(thr[i], 1.0))
+
+
 def detector_metrics(y, p, thr: float = 0.5) -> dict:
     y, p = np.asarray(y), np.asarray(p)
     pred = (p >= thr).astype(int)
@@ -74,7 +86,90 @@ def detector_metrics(y, p, thr: float = 0.5) -> dict:
     if len(set(y)) == 2:
         out["roc_auc"] = roc_auc_score(y, p)
         out["pr_auc"] = average_precision_score(y, p)
+        out["recall_at_fpr5"] = recall_at_fpr(y, p, 0.05)[0]
+        out["recall_at_fpr10"] = recall_at_fpr(y, p, 0.10)[0]
     return {k: round(float(v), 4) if isinstance(v, float) else v for k, v in out.items()}
+
+
+def pr_points(y, p, n: int = 40) -> list[list[float]]:
+    """A downsampled precision-recall curve for plotting."""
+    prec, rec, _ = precision_recall_curve(y, p)
+    idx = np.unique(np.linspace(0, len(prec) - 1, n).astype(int))
+    return [[round(float(rec[i]), 4), round(float(prec[i]), 4)] for i in idx]
+
+
+def load_real_rows(path: Path | None = None) -> list[dict]:
+    """Real maintainer changes mined from git history, as legitimate update rows."""
+    path = path or DATA / "real_histories.jsonl"
+    if not path.exists():
+        return []
+    rows = []
+    prefix = "realc" if "community" in path.name else "realf" if "final" in path.name else "real"
+    with open(path, encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            h = json.loads(line)
+            v = [x["description"] for x in h["versions"]]
+            for k in range(1, len(v)):
+                rows.append({"seq_id": f"{prefix}_{i:03d}", "step": k, "n_steps": len(v) - 1, "tool_id": h["tool_id"],
+                             "server": h["server"], "tool_name": h["tool_name"], "d0": v[0], "prev": v[k - 1],
+                             "new": v[k], "change_type": "real_change", "template_id": "real", "step_label": 0,
+                             "cum_label": 0, "payload_complete": False, "seq_type": "benign_real", "seq_label": 0,
+                             "style": None, "paradigm": None, "source_id": None, "base_source": "real_git_history",
+                             "hard_negative": False, "split": "real"})
+    return rows
+
+
+# Detector settings shared by every DualDetector built in this run (set by select_heads).
+DETECTOR_KW: dict = {}
+# Frozen after the development checks (experiments/generalization.py, dev_community_cv.py).
+# Candidates per head: (feature config, text mode, TF-IDF weight); C is tuned alongside.
+# Selection: validation recall at FPR <= 5%, then ROC-AUC.
+HEAD_CANDIDATES = {
+    "tfidf_features": (FeatureConfig(embed_added=False, embed_diff=False), "tfidf", 3.0),
+    "tfidf_features_w10": (FeatureConfig(embed_added=False, embed_diff=False), "tfidf", 10.0),
+    "embed_pooled": (FeatureConfig(embed_diff=False, drift=False, scope=False, sentence_pool=True), "embed", 1.0),
+    "hybrid": (FeatureConfig(embed_diff=False, sentence_pool=True), "hybrid", 10.0),
+}
+C_CANDIDATES = (0.1, 0.5, 2.0)
+REAL_WEIGHT = 20          # official servers' real changes (development set 1)
+COMMUNITY_WEIGHT = 1      # community real changes (development set 2), chosen in dev_community_cv.py
+COMMUNITY = DATA / "real_histories_community.jsonl"
+FINAL = DATA / "real_histories_final.jsonl"   # final held-out set: fresh community repos, scored once
+
+
+def real_for_training(real_dev: list[dict], train_rows: list[dict]) -> list[dict]:
+    """Development real changes whose server is a training server, weighted.
+
+    Real changes of a server in val or test would leak that server's text into training.
+    """
+    servers = {r["server"] for r in train_rows}
+    return [dict(r, weight=REAL_WEIGHT) for r in real_dev if r["server"] in servers]
+
+
+def select_heads(emb, train: list[dict], val: list[dict]) -> dict:
+    """Pick each head's feature set and regularization on validation data (never test).
+
+    Criterion: recall at FPR <= 5% on validation, then ROC-AUC.
+    """
+    table, chosen = [], {}
+    for head, label_key, cum in (("step", "step_label", False), ("cum", "cum_label", True)):
+        tr = [dict(r, prev=r["d0"]) for r in train] if cum else train
+        va = [dict(r, prev=r["d0"]) for r in val] if cum else val
+        y_va = [r[label_key] for r in va]
+        best = None
+        for name, (cfg, text, scale) in HEAD_CANDIDATES.items():
+            for C in C_CANDIDATES:
+                p = ChangeDetector(emb, cfg, C=C, text=text, tfidf_scale=scale).fit(
+                    tr, [r[label_key] for r in tr]).predict_proba(va)
+                score = (round(recall_at_fpr(y_va, p, 0.05)[0], 4), round(float(roc_auc_score(y_va, p)), 4))
+                table.append({"head": head, "features": name, "C": C, "val_recall_at_fpr5": score[0], "val_roc_auc": score[1]})
+                if best is None or score > best[0]:
+                    best = (score, name, C)
+        chosen[head] = {"features": best[1], "C": best[2]}
+    step, cum = HEAD_CANDIDATES[chosen["step"]["features"]], HEAD_CANDIDATES[chosen["cum"]["features"]]
+    DETECTOR_KW.update(config=step[0], step_text=step[1], step_scale=step[2], step_C=chosen["step"]["C"],
+                       cum_config=cum[0], cum_text=cum[1], cum_scale=cum[2], cum_C=chosen["cum"]["C"])
+    return {"chosen": chosen, "candidates": table}
 
 
 def out_of_fold(make, rows: list[dict]) -> tuple[np.ndarray, np.ndarray]:
@@ -152,16 +247,16 @@ def fit_policies(fit_seqs, fit_seqs_newonly, costs):
 
 # --- policy experiments -------------------------------------------------------
 
-SEQ_TYPES = ("one_shot", "slow_split", "slow_decomposed", "mixed", "benign")
+SEQ_TYPES = ("one_shot", "slow_split", "slow_decomposed", "mixed", "benign", "benign_real")
 N_BOOT = 200 if QUICK else 1000
 
 
 def build_scored(emb, train, val, test, det=None, det_new=None) -> dict:
     """Detector scores for the policy-fit set (out-of-fold train + val) and for test."""
     yt = np.array([r["step_label"] for r in train])
-    det = det or DualDetector(emb).fit(train)
+    det = det or DualDetector(emb, **DETECTOR_KW).fit(train)
     det_new = det_new or ChangeDetector(emb, new_only=True).fit(train, yt)
-    oof_step, oof_cum = out_of_fold(lambda: DualDetector(emb), train)
+    oof_step, oof_cum = out_of_fold(lambda: DualDetector(emb, **DETECTOR_KW), train)
     oof_new = np.zeros(len(train))
     for tr_i, te_i in GroupKFold(n_splits=5).split(train, yt, [r["server"] for r in train]):
         oof_new[te_i] = ChangeDetector(emb, new_only=True).fit(
@@ -226,16 +321,18 @@ def resplit(rows: list[dict], seed: int) -> list[dict]:
     return [dict(r, split=seqs[r["seq_id"]]["split"]) for r in rows]
 
 
-def multi_split(rows: list[dict], emb, costs) -> dict:
+def multi_split(rows: list[dict], emb, costs, real_dev: list[dict] = (), community: list[dict] = ()) -> dict:
     """Main comparisons repeated over several server splits: mean, std and wins per policy."""
     slow_ids = {r["seq_id"] for r in rows if r["change_type"].startswith("malicious_slow")}
-    runs = {"seen": [], "unseen_slow": []}
+    runs = {"seen": [], "unseen_slow": [], "unseen_slow_augmented": []}
     for seed in SPLIT_SEEDS:
         rs = resplit(rows, seed)
         part = {k: [r for r in rs if r["split"] == k] for k in ("train", "val", "test")}
-        settings = {"seen": (part["train"], part["val"]),
-                    "unseen_slow": ([r for r in part["train"] if r["seq_id"] not in slow_ids],
-                                    [r for r in part["val"] if r["seq_id"] not in slow_ids])}
+        part["train"] = part["train"] + real_for_training(list(real_dev), part["train"]) + list(community)
+        tr_u = [r for r in part["train"] if r["seq_id"] not in slow_ids]
+        va_u = [r for r in part["val"] if r["seq_id"] not in slow_ids]
+        settings = {"seen": (part["train"], part["val"]), "unseen_slow": (tr_u, va_u),
+                    "unseen_slow_augmented": (tr_u + augment_slow(tr_u, seed), va_u + augment_slow(va_u, seed + 1))}
         for name, (tr, va) in settings.items():
             res, _, _ = compare_policies(build_scored(emb, tr, va, part["test"]), costs, boot=False)
             runs[name].append({"seed": seed, "results": {r["name"]: r for r in res["results"]},
@@ -300,26 +397,90 @@ def main() -> int:
     emb = SentenceEmbedder(DATA / "cache" / "embeddings.npz")
     out: dict = {"data": {k: {"updates": len(v), "attack_updates": int(y[k].sum())} for k, v in by_split.items()}}
 
+    real = load_real_rows()                  # development set 1: official servers' git history
+    community = [dict(r, weight=COMMUNITY_WEIGHT) for r in load_real_rows(COMMUNITY)]  # development set 2
+    held = load_real_rows(FINAL)             # final held-out set: fresh community repos, never used to fit or tune
+    train_bench = train
+    # Community repos are disjoint from every benchmark server, so they can join training without leaking.
+    train = train_bench + real_for_training(real, train_bench) + community
+    y["train"] = np.array([r["step_label"] for r in train])
+    out["data"]["train"]["real_changes_added"] = len(train) - len(train_bench)
+
     def ours():
-        return DualDetector(emb)
+        return DualDetector(emb, **DETECTOR_KW)
 
     def step_only():
-        return ChangeDetector(emb)
+        return ChangeDetector(emb, DETECTOR_KW["config"], C=DETECTOR_KW["step_C"], text=DETECTOR_KW["step_text"],
+                              tfidf_scale=DETECTOR_KW["step_scale"])
 
     def new_only():
         return ChangeDetector(emb, new_only=True)
 
-    print("1/7 training detectors")
+    print("1/7 selecting detector settings on validation, training detectors")
+    out["head_selection"] = select_heads(emb, train, val)
     det = ours().fit(train)
     det.save(MODELS / "detector.joblib")
     det_new = new_only().fit(train, y["train"])
+    tfidf = {mode: TfidfDetector(mode).fit(train, y["train"]) for mode in ("new", "added")}
     emb.save()
 
     print("2/7 detector metrics")
     test_step, test_cum = score_rows(det, test)
     test_new = det_new.predict_proba(test)
+    test_tfidf = {mode: d.predict_proba(test) for mode, d in tfidf.items()}
     det_out = {"change_pair": detector_metrics(y["test"], test_step), "new_only": detector_metrics(y["test"], test_new),
+               "tfidf_new": detector_metrics(y["test"], test_tfidf["new"]),
+               "tfidf_added": detector_metrics(y["test"], test_tfidf["added"]),
                "cumulative_head": detector_metrics([r["cum_label"] for r in test], test_cum)}
+    det_out["pr_curves"] = {"change_pair": pr_points(y["test"], test_step), "new_only": pr_points(y["test"], test_new),
+                            "tfidf_new": pr_points(y["test"], test_tfidf["new"]),
+                            "tfidf_added": pr_points(y["test"], test_tfidf["added"])}
+
+    if held:
+        # Final held-out real-world false positives (fresh community repos, never used to fit or tune).
+        # Thresholds: 0.5, and the one giving FPR <= 5% on validation. The ablations show what the
+        # text model and the real training data each contribute.
+        embed_cfg, _, _ = HEAD_CANDIDATES["embed_pooled"]
+        embed_real = ChangeDetector(emb, embed_cfg, C=0.1).fit(train, y["train"])
+        chosen_no_real = step_only().fit(train_bench, [r["step_label"] for r in train_bench])
+        models = {"change_pair": det.step, "new_only": det_new, "tfidf_new": tfidf["new"], "tfidf_added": tfidf["added"],
+                  "ablation_embeddings_with_real": embed_real, "ablation_chosen_no_real": chosen_no_real}
+        y_val = [r["step_label"] for r in val]
+        repos = sorted({r["server"] for r in held})
+        out["real_world"] = {"changes": len(held), "tools": len({r["tool_id"] for r in held}), "servers": len(repos),
+                             "source": "fresh community MCP repos (git history)", "detectors": {}}
+        attacks = [r for r in test if r["step_label"] == 1]
+        reworded = [(a, b) for a, b in ((r, reword_update(r)) for r in attacks) if b["new"] != a["new"]]
+        softened = [r for r in attacks if r["style"] == "softened"]
+        test_benign = [r for r in test if r["step_label"] == 0]
+        out["robustness"] = {"reworded_n": len(reworded), "softened_n": len(softened), "detectors": {}}
+        for name, m in models.items():
+            p, thr5 = m.predict_proba(held), recall_at_fpr(y_val, m.predict_proba(val), 0.05)[1]
+            per_repo = [float(np.mean([pi >= thr5 for pi, r in zip(p, held) if r["server"] == s])) for s in repos]
+            out["real_world"]["detectors"][name] = {
+                "fpr_at_0.5": round(float(np.mean(p >= 0.5)), 4),
+                "fpr_at_val_fpr5_threshold": round(float(np.mean(p >= thr5)), 4),
+                "fpr_at_val_fpr5_threshold_repo_avg": round(float(np.mean(per_repo)), 4),
+                "val_fpr5_threshold": round(thr5, 4), "mean_score": round(float(np.mean(p)), 4)}
+            # Same threshold on the test servers: attacks caught as written, softened and reworded.
+            caught = lambda rs: round(float(np.mean(m.predict_proba(rs) >= thr5)), 4) if rs else None  # noqa: E731
+            out["robustness"]["detectors"][name] = {
+                "recall": caught(attacks), "fpr": caught(test_benign), "softened_recall": caught(softened),
+                "reworded_recall_original": caught([a for a, _ in reworded]),
+                "reworded_recall": caught([b for _, b in reworded])}
+    if real:
+        # Development set, scored by grouped cross-validation (it is part of training).
+        groups = [r["server"] for r in real]
+        cv_p = np.zeros(len(real))
+        n_folds = min(5, len(set(groups)))
+        for tr_i, te_i in GroupKFold(n_splits=n_folds).split(real, groups=groups):
+            extra = [dict(real[i], weight=REAL_WEIGHT) for i in tr_i]
+            d = step_only().fit(train_bench + extra, [r["step_label"] for r in train_bench + extra])
+            cv_p[te_i] = d.predict_proba([real[i] for i in te_i])
+        out.setdefault("real_world", {})["development_set_cv"] = {
+            "changes": len(real), "fpr_at_0.5": round(float(np.mean(cv_p >= 0.5)), 4),
+            "mean_score": round(float(np.mean(cv_p)), 4), "folds": n_folds,
+            "note": "official servers' history; train + real changes of the other server groups (weight 20)"}
     for group_key in ("style", "seq_type", "change_type"):
         det_out[f"by_{group_key}"] = {}
         for value in sorted({str(r[group_key]) for r in test}):
@@ -377,14 +538,30 @@ def main() -> int:
     costs = Costs()
     out["policies"], pols, mdp = compare_policies(scored, costs)
     out["policies"]["costs"] = costs.__dict__
+    if held:
+        r_step, r_cum = det.predict(held)
+        real_seqs, real_new = to_sequences(held, r_step, r_cum), to_sequences(held, *[det_new.predict_proba(held)] * 2)
+        out["real_world"]["policies"] = {}
+        for name, pol, seqs in (("hash_pinning", HashPin(), real_seqs), ("threshold_new_only", pols["thr_new"], real_new),
+                                ("threshold", pols["thr"], real_seqs), ("history_rule", pols["rule"], real_seqs),
+                                ("cumulative_threshold", pols["cum"], real_seqs), ("mdp", pols["mdp"], real_seqs)):
+            r = simulate_avg(pol, seqs, costs, SEEDS)
+            out["real_world"]["policies"][name] = {"fbr": round(r.fbr, 4), "rb": round(r.rb, 4)}
     slow_ids = {r["seq_id"] for r in rows if r["change_type"].startswith("malicious_slow")}
     tr_u, va_u = [r for r in train if r["seq_id"] not in slow_ids], [r for r in val if r["seq_id"] not in slow_ids]
     scored_u = build_scored(emb, tr_u, va_u, test)
     emb.save()
     out["unseen_slow"], _, _ = compare_policies(scored_u, costs)
     out["unseen_slow"].update(train_updates=len(tr_u), sequence_level_auc=sequence_level(scored_u))
+    # Same setting, but the defender splits its own known one-shot poisons into synthetic slow histories.
+    aug_tr, aug_va = augment_slow(tr_u, 0), augment_slow(va_u, 1)
+    scored_a = build_scored(emb, tr_u + aug_tr, va_u + aug_va, test)
+    emb.save()
+    out["unseen_slow_augmented"], _, _ = compare_policies(scored_a, costs)
+    out["unseen_slow_augmented"].update(train_updates=len(tr_u) + len(aug_tr), augmented_updates=len(aug_tr),
+                                        sequence_level_auc=sequence_level(scored_a))
     print(f"   repeating both comparisons over {len(SPLIT_SEEDS)} server splits")
-    out["multi_split"] = multi_split(rows, emb, costs)
+    out["multi_split"] = multi_split(rows, emb, costs, real, community)
     space = pols["mdp"].space
     out["mdp_policy_table"] = [
         {"state": dict(zip(("step_risk", "cum_risk", "updates", "prior_max"), st)), "visits": int(mdp.counts[i]),

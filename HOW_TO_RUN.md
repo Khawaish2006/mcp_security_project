@@ -61,7 +61,7 @@ You'll know the environment is active when your prompt starts with `(.venv)`. Ac
 python -m pytest -q
 ```
 
-Expected result: **58 passed** in under a minute, or **52 passed, 6 skipped** in a GitHub clone without the MCPTox data. These tests use a lightweight stand-in for the embedding model, so they need no download.
+Expected result: **70 passed** in under a minute, or **64 passed, 6 skipped** in a GitHub clone without the MCPTox data. These tests use a lightweight stand-in for the embedding model, so they need no download.
 
 ## 5. Run the project
 

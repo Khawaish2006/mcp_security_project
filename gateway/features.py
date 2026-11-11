@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from gateway.diff import added_text
+from gateway.diff import added_text, split_sentences
 
 # Tool-like names: quoted identifiers with _ or -, bare snake_case, bare camelCase.
 # Bare kebab-case is excluded: it matches ordinary words like "read-only".
@@ -64,12 +64,17 @@ class FeatureConfig:
     drift: bool = True           # delta, Delta
     scope: bool = True           # s
     flags: bool = True           # h(A_k)
+    length: bool = True          # len(A_k)/len(prev), number of added sentences
+    sentence_pool: bool = False  # phi(A_k) as [mean; max] over per-sentence embeddings
 
 
 def build_features(rows: list[dict], embedder, config: FeatureConfig = FeatureConfig()) -> tuple[np.ndarray, list[str]]:
     """rows need keys d0, prev, new, tool_name. Returns (X, column names)."""
     added = [added_text(r["prev"], r["new"]) for r in rows]
-    texts = sorted({t for r, a in zip(rows, added) for t in (r["d0"], r["prev"], r["new"], a, f"{r['tool_name']}: {r['d0']}")})
+    sents = [split_sentences(a) or [""] for a in added] if config.sentence_pool else []
+    texts = {t for r, a in zip(rows, added) for t in (r["d0"], r["prev"], r["new"], a, f"{r['tool_name']}: {r['d0']}")}
+    texts |= {s for ss in sents for s in ss}
+    texts = sorted(texts)
     index = {t: i for i, t in enumerate(texts)}
     E = embedder.encode(texts)
 
@@ -78,7 +83,13 @@ def build_features(rows: list[dict], embedder, config: FeatureConfig = FeatureCo
 
     blocks, names = [], []
     e_added = np.stack([emb(a) for a in added])
-    if config.embed_added:
+    if config.embed_added and config.sentence_pool:
+        # Long legitimate documentation and a short injected instruction look alike once
+        # squashed into one vector; per-sentence pooling keeps the most suspicious sentence visible.
+        S = [np.stack([emb(s) for s in ss]) for ss in sents]
+        blocks += [np.stack([s.mean(0) for s in S]), np.stack([s.max(0) for s in S])]
+        names += [f"emb_added_mean_{i}" for i in range(E.shape[1])] + [f"emb_added_max_{i}" for i in range(E.shape[1])]
+    elif config.embed_added:
         blocks.append(e_added)
         names += [f"emb_added_{i}" for i in range(e_added.shape[1])]
     e_new = np.stack([emb(r["new"]) for r in rows])
@@ -95,7 +106,8 @@ def build_features(rows: list[dict], embedder, config: FeatureConfig = FeatureCo
             row += [1.0 - float(en @ ep), 1.0 - float(en @ e0)]
         if config.scope:
             row.append(float(emb(a) @ emb(f"{r['tool_name']}: {r['d0']}")) if a else 1.0)
-        row += [len(a) / max(len(r["prev"]), 1), float(a.count(". ") + (1 if a else 0))]
+        if config.length:
+            row += [len(a) / max(len(r["prev"]), 1), float(a.count(". ") + (1 if a else 0))]
         if config.flags:
             row += list(security_flags(a, r["tool_name"]).values())
         numeric.append(row)
@@ -104,7 +116,8 @@ def build_features(rows: list[dict], embedder, config: FeatureConfig = FeatureCo
         names += ["delta_step", "drift_cum"]
     if config.scope:
         names.append("scope")
-    names += ["len_ratio", "n_added_sentences"]
+    if config.length:
+        names += ["len_ratio", "n_added_sentences"]
     if config.flags:
         names += FLAG_NAMES
     return np.hstack(blocks), names
